@@ -23,6 +23,7 @@ recipes=(
   # gates exclude all release lines still receiving builds live in
   # ../recipes-archive/.
   "armv6l"                  # major < 24
+  "armv7l"                  # major >= 24
   "x64-debug"               # major < 24
 )
 

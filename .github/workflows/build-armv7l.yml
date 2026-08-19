@@ -1,0 +1,157 @@
+name: Build Node.js armv7l
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_version:
+        description: 'Node.js version to build (e.g. v24.19.0)'
+        required: true
+        type: string
+  schedule:
+    # Check for new releases daily at 06:00 UTC
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ inputs.node_version }}" ]; then
+            echo "version=${{ inputs.node_version }}" >> "$GITHUB_OUTPUT"
+          else
+            VERSION=$(curl -fsSL https://nodejs.org/dist/index.json \
+              | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for r in data:
+              v = r['version']
+              major = int(v.lstrip('v').split('.')[0])
+              if major >= 24 and '-' not in v:
+                  print(v)
+                  break
+          ")
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="armv7l-${VERSION}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $TAG already exists, skipping"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve-version
+    if: needs.resolve-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      NODE_VERSION: ${{ needs.resolve-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Set up swap (cross-compiling V8 for 32-bit arm needs extra memory)
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install cross-compilation toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-14-multilib g++-14-multilib \
+            libc6-dev-i386 \
+            gcc-14-arm-linux-gnueabihf \
+            g++-14-arm-linux-gnueabihf \
+            gcc-14-arm-linux-gnueabihf-base \
+            ccache
+          # GCC -m32 needs asm/ headers; on Ubuntu 24.04 they live under
+          # the x86_64 multiarch path and are not found by default.
+          sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm
+
+      - name: Download and verify Node.js source
+        run: |
+          curl -fsSLO "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}.tar.xz"
+          curl -fsSLO "https://nodejs.org/dist/${NODE_VERSION}/SHASUMS256.txt"
+          grep "node-${NODE_VERSION}.tar.xz" SHASUMS256.txt | sha256sum -c -
+
+      - name: Extract source
+        run: tar -xf "node-${NODE_VERSION}.tar.xz"
+
+      - name: Cross-compile Node.js for armv7l
+        run: |
+          cd "node-${NODE_VERSION}"
+
+          export CC_host="ccache gcc-14 -m32"
+          export CXX_host="ccache g++-14 -m32"
+          export CC="ccache arm-linux-gnueabihf-gcc-14 -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
+          export CXX="ccache arm-linux-gnueabihf-g++-14 -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
+
+          # -j4 keeps peak RSS around 12-14 GB, safe for 16 GB runners.
+          # On private-repo runners (7 GB) use -j2 and add more swap.
+          make -j4 binary V= \
+            DESTCPU="arm" \
+            ARCH="armv7l" \
+            VARIATION="" \
+            DISTTYPE="release" \
+            CUSTOMTAG="" \
+            DATESTRING="" \
+            COMMIT="" \
+            RELEASE_URLBASE="https://unofficial-builds.nodejs.org/download/release/" \
+            CONFIG_FLAGS=""
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          mv "node-${NODE_VERSION}"/node-*.tar.?z out/
+          ( cd out && sha256sum node-* > SHASUMS256.txt )
+          ls -lh out/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ env.NODE_VERSION }}-linux-armv7l
+          path: out/
+
+      - name: Create GitHub release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="armv7l-${NODE_VERSION}"
+          gh release create "$TAG" out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Node.js ${NODE_VERSION} linux-armv7l" \
+            --notes "$(cat <<NOTES
+          Cross-compiled Node.js ${NODE_VERSION} for linux-armv7l (ARMv7 hard-float).
+
+          Built on Ubuntu 24.04 x64 with GCC 14 cross-compiler.
+          Linked against glibc 2.39 — runs on any armhf system with glibc >= 2.39:
+          - Debian 13 (trixie) armhf — glibc 2.41 ✓
+          - Ubuntu 24.04+ armhf — glibc 2.39 ✓
+          - Raspberry Pi OS (bookworm) — glibc 2.36 ✗ (too old)
+          - Debian 12 (bookworm) armhf — glibc 2.36 ✗ (too old)
+          NOTES
+          )"
