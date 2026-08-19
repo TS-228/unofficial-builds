@@ -80,16 +80,15 @@ jobs:
       - name: Install cross-compilation toolchain
         run: |
           sudo apt-get update
+          # gcc-multilib and gcc-arm-linux-gnueabihf conflict (Ubuntu bug
+          # #1300211), so we use gcc-i686-linux-gnu as the 32-bit host
+          # compiler instead of gcc -m32 with multilib.
           sudo apt-get install -y \
-            gcc-14-multilib g++-14-multilib \
-            libc6-dev-i386 \
+            gcc-14-i686-linux-gnu g++-14-i686-linux-gnu \
             gcc-14-arm-linux-gnueabihf \
             g++-14-arm-linux-gnueabihf \
             gcc-14-arm-linux-gnueabihf-base \
             ccache
-          # GCC -m32 needs asm/ headers; on Ubuntu 24.04 they live under
-          # the x86_64 multiarch path and are not found by default.
-          sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 
       - name: Download and verify Node.js source
         run: |
@@ -104,8 +103,8 @@ jobs:
         run: |
           cd "node-${NODE_VERSION}"
 
-          export CC_host="ccache gcc-14 -m32"
-          export CXX_host="ccache g++-14 -m32"
+          export CC_host="ccache i686-linux-gnu-gcc-14"
+          export CXX_host="ccache i686-linux-gnu-g++-14"
           export CC="ccache arm-linux-gnueabihf-gcc-14 -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
           export CXX="ccache arm-linux-gnueabihf-g++-14 -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
 
