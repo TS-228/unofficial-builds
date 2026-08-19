@@ -112,7 +112,7 @@ if [[ ! -f "$sourcefile" ]]; then
   echo "Downloading source tarball..."
   docker run --rm \
     --user=${USER_ID} \
-    -v "${sourcedir}:/out" \
+    -v "${sourcedir}:/out:z" \
     "${image_tag_pfx}fetch-source" \
     "$unofficial_release_urlbase" "$disttype" "$customtag" "$datestring" "$commit" "$fullversion" "$source_url" "$source_urlbase"
   echo "Done, source tarball is at ${sourcefile}"
@@ -123,9 +123,9 @@ fi
 ## -- RUN BUILD -- ##
 
 echo "Building ${recipe} recipe..."
-sourcemount="${sourcefile}:/home/node/node.tar.xz"
-stagingmount="${stagingoutdir}:/out"
-ccachemount="${ccachedir}/${recipe}/:/home/node/.ccache/"
+sourcemount="${sourcefile}:/home/node/node.tar.xz:z"
+stagingmount="${stagingoutdir}:/out:z"
+ccachemount="${ccachedir}/${recipe}/:/home/node/.ccache/:z"
 mkdir -p "${ccachedir}/${recipe}"
 docker run --rm \
   --user=${USER_ID} \
