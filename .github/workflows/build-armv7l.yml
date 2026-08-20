@@ -80,17 +80,27 @@ jobs:
       - name: Install cross-compilation toolchain
         run: |
           sudo apt-get update
-          # Ubuntu doesn't allow installing gcc-multilib together with the
-          # armhf cross compiler (LP: #1300211). For the 32-bit host V8
-          # build, we use gcc-14 -m32 and provide the missing asm headers via
-          # a symlink.
+
           sudo apt-get install -y \
+            gcc-14 \
+            g++-14 \
+            libc6-dev \
             libc6-dev-i386 \
             gcc-14-arm-linux-gnueabihf \
             g++-14-arm-linux-gnueabihf \
             gcc-14-arm-linux-gnueabihf-base \
             ccache
+
           sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm
+
+          echo "Host C++ config:"
+          g++-14 -print-file-name=include/c++config.h
+
+          echo "Host 32-bit C++ config:"
+          g++-14 -m32 -print-file-name=include/c++config.h
+
+          echo "ARM C++ config:"
+          arm-linux-gnueabihf-g++-14 -print-file-name=include/c++config.h
 
       - name: Download and verify Node.js source
         run: |
