@@ -10,13 +10,22 @@ on:
   schedule:
     # Check for new releases daily at 06:00 UTC
     - cron: '0 6 * * *'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-armv7l.yml'
+      - 'recipes/armv7l/**'
+  pull_request:
+    paths:
+      - '.github/workflows/build-armv7l.yml'
+      - 'recipes/armv7l/**'
 
 permissions:
   contents: write
 
 jobs:
   resolve-version:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
       should_build: ${{ steps.check.outputs.should_build }}
@@ -48,6 +57,11 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           TAG="armv7l-${VERSION}"
+          # Always rebuild on pull_request so toolchain changes get a full compile.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             echo "Release $TAG already exists, skipping"
             echo "should_build=false" >> "$GITHUB_OUTPUT"
@@ -58,7 +72,7 @@ jobs:
   build:
     needs: resolve-version
     if: needs.resolve-version.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       NODE_VERSION: ${{ needs.resolve-version.outputs.version }}
     steps:
@@ -80,27 +94,54 @@ jobs:
       - name: Install cross-compilation toolchain
         run: |
           sudo apt-get update
-
           sudo apt-get install -y \
             gcc-14 \
             g++-14 \
+            gcc-14-multilib \
+            g++-14-multilib \
             libc6-dev \
             libc6-dev-i386 \
+            lib32stdc++-14-dev \
             gcc-14-arm-linux-gnueabihf \
             g++-14-arm-linux-gnueabihf \
             gcc-14-arm-linux-gnueabihf-base \
-            ccache
+            ccache \
+            python3
 
           sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm
+          sudo cp recipes/armv7l/host-cc.sh /usr/local/bin/gcc-14-m32
+          sudo cp recipes/armv7l/host-cxx.sh /usr/local/bin/g++-14-m32
+          sudo chmod 755 /usr/local/bin/gcc-14-m32 /usr/local/bin/g++-14-m32
 
           echo "Host C++ config:"
-          g++-14 -print-file-name=include/c++config.h
-
+          g++-14 -print-file-name=bits/c++config.h
           echo "Host 32-bit C++ config:"
-          g++-14 -m32 -print-file-name=include/c++config.h
-
+          g++-14 -m32 -print-file-name=bits/c++config.h
           echo "ARM C++ config:"
-          arm-linux-gnueabihf-g++-14 -print-file-name=include/c++config.h
+          arm-linux-gnueabihf-g++-14 -print-file-name=bits/c++config.h
+
+          echo '#include <cstdint>' | g++-14 -m32 -x c++ -c - -o /tmp/m32-cxx.o
+
+      - name: Install Rust targets for 32-bit host and armv7
+        run: |
+          rustup toolchain install 1.91.1 --profile minimal --no-self-update
+          rustup default 1.91.1
+          rustup target add --toolchain 1.91.1 i686-unknown-linux-gnu armv7-unknown-linux-gnueabihf
+          rustc --version
+          rustup target list --installed
+
+          echo 'fn main() {}' > /tmp/hi.rs
+          rustc --target i686-unknown-linux-gnu -C linker=gcc-14-m32 /tmp/hi.rs -o /tmp/hi-i686
+          rustc --target armv7-unknown-linux-gnueabihf -C linker=arm-linux-gnueabihf-gcc-14 /tmp/hi.rs -o /tmp/hi-armv7
+          file /tmp/hi-i686 /tmp/hi-armv7
+
+      - name: Install cargo shim
+        run: |
+          mkdir -p "$HOME/bin/cargo-shim"
+          cp recipes/armv7l/cargo-shim.sh "$HOME/bin/cargo-shim/cargo"
+          chmod 755 "$HOME/bin/cargo-shim/cargo"
+          echo "CARGO_REAL=$(command -v cargo)" >> "$GITHUB_ENV"
+          echo "$HOME/bin/cargo-shim" >> "$GITHUB_PATH"
 
       - name: Download and verify Node.js source
         run: |
@@ -111,14 +152,31 @@ jobs:
       - name: Extract source
         run: tar -xf "node-${NODE_VERSION}.tar.xz"
 
+      - name: Patch rust crates for cross-compilation
+        run: |
+          mkdir -p "node-${NODE_VERSION}/.cargo"
+          cp recipes/armv7l/cargo-config.toml "node-${NODE_VERSION}/.cargo/config.toml"
+          ( cd "node-${NODE_VERSION}" && ../recipes/armv7l/patch-crates-gyp.sh )
+
       - name: Cross-compile Node.js for armv7l
         run: |
           cd "node-${NODE_VERSION}"
 
-          export CC_host="ccache gcc-14 -m32"
-          export CXX_host="ccache g++-14 -m32"
+          export CC_host="ccache gcc-14-m32"
+          export CXX_host="ccache g++-14-m32"
           export CC="ccache arm-linux-gnueabihf-gcc-14 -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
           export CXX="ccache arm-linux-gnueabihf-g++-14 -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
+          export CC_i686_unknown_linux_gnu=gcc-14-m32
+          export CXX_i686_unknown_linux_gnu=g++-14-m32
+          export CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc-14
+          export CXX_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-g++-14
+
+          major=${NODE_VERSION#v}
+          major=${major%%.*}
+          CONFIG_FLAGS=""
+          if [ "$major" -ge 26 ]; then
+            CONFIG_FLAGS="--v8-enable-temporal-support"
+          fi
 
           # -j4 keeps peak RSS around 12-14 GB, safe for 16 GB runners.
           # On private-repo runners (7 GB) use -j2 and add more swap.
@@ -131,7 +189,7 @@ jobs:
             DATESTRING="" \
             COMMIT="" \
             RELEASE_URLBASE="https://unofficial-builds.nodejs.org/download/release/" \
-            CONFIG_FLAGS=""
+            CONFIG_FLAGS="$CONFIG_FLAGS"
 
       - name: Collect artifacts
         run: |
@@ -139,6 +197,8 @@ jobs:
           mv "node-${NODE_VERSION}"/node-*.tar.?z out/
           ( cd out && sha256sum node-* > SHASUMS256.txt )
           ls -lh out/
+          tar -xOf out/node-*.tar.xz --wildcards '*/bin/node' > /tmp/node.bin
+          file /tmp/node.bin
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
