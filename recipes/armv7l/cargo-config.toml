@@ -1,0 +1,5 @@
+[target.i686-unknown-linux-gnu]
+linker = "gcc-14-m32"
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc-14"
