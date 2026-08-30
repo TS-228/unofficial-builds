@@ -1,0 +1,175 @@
+name: Docker armv7l (Debian slim)
+
+on:
+  schedule:
+    # Weekly rebuild for base-image / security updates even without a new Node build.
+    - cron: '0 7 * * 0'
+  workflow_dispatch:
+    inputs:
+      node_version:
+        description: 'Node.js version tag to package (e.g. v26.8.1). Empty = latest armv7l GitHub release.'
+        required: false
+        type: string
+        default: ''
+  release:
+    types: [published]
+  push:
+    branches: [main]
+    paths:
+      - 'docker/armv7l/**'
+      - '.github/workflows/docker-armv7l.yml'
+  pull_request:
+    paths:
+      - 'docker/armv7l/**'
+      - '.github/workflows/docker-armv7l.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-armv7l-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      tag: ${{ steps.pick.outputs.tag }}
+      should_build: ${{ steps.pick.outputs.should_build }}
+      image: ${{ steps.pick.outputs.image }}
+    steps:
+      - name: Resolve Node.js armv7l release
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.node_version }}
+        run: |
+          set -euo pipefail
+
+          REPO_LC="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          IMAGE="ghcr.io/${REPO_LC}/node-armv7l"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+          # Only package armv7l-* releases; ignore other tags.
+          if [ "${{ github.event_name }}" = "release" ]; then
+            REL_TAG="${{ github.event.release.tag_name }}"
+            case "$REL_TAG" in
+              armv7l-v*)
+                VERSION="${REL_TAG#armv7l-}"
+                ;;
+              *)
+                echo "Skipping non-armv7l release tag: ${REL_TAG}"
+                echo "should_build=false" >> "$GITHUB_OUTPUT"
+                echo "version=" >> "$GITHUB_OUTPUT"
+                echo "tag=" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+          elif [ -n "${INPUT_VERSION}" ]; then
+            VERSION="${INPUT_VERSION}"
+            case "$VERSION" in
+              v*) ;;
+              *) VERSION="v${VERSION}" ;;
+            esac
+            REL_TAG="armv7l-${VERSION}"
+            if ! gh release view "$REL_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "Release ${REL_TAG} not found in ${GITHUB_REPOSITORY}" >&2
+              exit 1
+            fi
+          else
+            REL_TAG="$(
+              gh release list --repo "$GITHUB_REPOSITORY" --limit 50 \
+                --json tagName,isLatest \
+                --jq '[.[] | select(.tagName | startswith("armv7l-v"))] | (map(select(.isLatest)) + .)[0].tagName // empty'
+            )"
+            if [ -z "$REL_TAG" ]; then
+              echo "No armv7l-* GitHub release found in ${GITHUB_REPOSITORY}" >&2
+              exit 1
+            fi
+            VERSION="${REL_TAG#armv7l-}"
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${REL_TAG}" >> "$GITHUB_OUTPUT"
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${REL_TAG} -> Node ${VERSION}, image ${IMAGE}"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      NODE_VERSION: ${{ needs.resolve.outputs.version }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      IMAGE: ${{ needs.resolve.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ env.NODE_VERSION }}
+            type=raw,value=${{ env.NODE_VERSION }},suffix=-debian-stable
+            type=raw,value=debian-stable
+          labels: |
+            org.opencontainers.image.title=node-armv7l
+            org.opencontainers.image.description=Node.js ${{ env.NODE_VERSION }} linux-armv7l on Debian stable-slim
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.NODE_VERSION }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/armv7l/Dockerfile
+          platforms: linux/arm/v7
+          push: ${{ github.event_name != 'pull_request' }}
+          pull: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            NODE_VERSION=${{ env.NODE_VERSION }}
+            RELEASE_REPO=${{ github.repository }}
+            RELEASE_TAG=${{ env.RELEASE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        if: github.event_name != 'pull_request'
+        run: |
+          {
+            echo "## node-armv7l image"
+            echo ""
+            echo "- Node.js: \`${NODE_VERSION}\`"
+            echo "- Release: \`${RELEASE_TAG}\`"
+            echo "- Base: \`debian:stable-slim\` (linux/arm/v7)"
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Tags: \`latest\`, \`${NODE_VERSION}\`, \`debian-stable\`"
+            echo ""
+            echo '```'
+            echo "docker pull ${IMAGE}:${NODE_VERSION}"
+            echo "docker run --rm ${IMAGE}:${NODE_VERSION} node --version"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
