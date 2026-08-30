@@ -2,8 +2,11 @@ name: Docker armv7l (Debian slim)
 
 on:
   schedule:
-    # Weekly rebuild for base-image / security updates even without a new Node build.
-    - cron: '0 7 * * 0'
+    # Weekly Debian security rebuild. The Node job starts daily at 06:00 UTC
+    # and a full compile can take several hours, so this runs late Sunday
+    # (20:00 UTC) to avoid overlapping that run. New Node binaries still
+    # trigger an image rebuild immediately via `release: published`.
+    - cron: '0 20 * * 0'
   workflow_dispatch:
     inputs:
       node_version:
